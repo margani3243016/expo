@@ -1,60 +1,147 @@
----
-title: EAS Build
-sidebar_title: Introduction
-hideTOC: true
-description: EAS Build is a hosted service for building app binaries for your Expo and React Native projects.
----
+// mobile/App.js
+import React, { useState, useEffect, useRef } from "react";
+import { View, Text, TouchableOpacity, Image, ActivityIndicator, StyleSheet } from "react-native";
+import * as Audio from "expo-av";
+import * as FileSystem from "expo-file-system";
+import * as Permissions from "expo-permissions";
+import { GestureResponderEvent } from "react-native";
 
-import { Cube01Icon } from '@expo/styleguide-icons/outline/Cube01Icon';
+const SERVER_BASE = "http://YOUR_SERVER_IP:3001"; // <-- تنظیم کن (یا URL https)
 
-import { BoxLink } from '~/ui/components/BoxLink';
+export default function App() {
+  const [recording, setRecording] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [lucyMood, setLucyMood] = useState("neutral");
+  const [displayText, setDisplayText] = useState("سلام، امیر. آماده‌ام.");
+  const soundRef = useRef(null);
 
-**EAS Build** is a hosted service for building app binaries for your Expo and React Native projects.
+  const moods = {
+    neutral: require("./assets/lucy_neutral.png"),
+    happy: require("./assets/lucy_happy.png"),
+    sad: require("./assets/lucy_sad.png"),
+    angry: require("./assets/lucy_angry.png"),
+    shy: require("./assets/lucy_shy.png"),
+  };
 
-It makes building your apps for distribution simple and easy to automate by providing defaults that work well for Expo and React Native projects out of the box, and by handling your app signing credentials for you (if you wish). It also makes sharing builds with your team easier than ever with [internal distribution](/build/internal-distribution/) (using ad hoc and/or enterprise "universal" provisioning), deeply integrates with EAS Submit for app store submissions, and has first-class support for the [`expo-updates`](/build/updates/) library.
+  useEffect(() => {
+    Audio.Sound.createAsync && console.log("Ready");
+  }, []);
 
-It's designed to work for any native project, whether or not you use Expo and React Native. It's the fastest way to get from `npx create-expo-app` or `npx @react-native-community/cli@latest init` to app stores.
+  async function startRecording() {
+    try {
+      const perm = await Audio.requestPermissionsAsync();
+      if (perm.status !== "granted") {
+        alert("اجازه میکروفون لازم است.");
+        return;
+      }
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync(Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY);
+      await rec.startAsync();
+      setRecording(rec);
+    } catch (err) {
+      console.error(err);
+    }
+  }
 
-### Get started
+  async function stopRecordingAndSend() {
+    if (!recording) return;
+    setIsProcessing(true);
+    try {
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      // upload to server /transcribe
+      const formData = new FormData();
+      const file = {
+        uri,
+        name: "recording.wav",
+        type: "audio/wav"
+      };
+      formData.append("audio", file);
+      const resp = await fetch(`${SERVER_BASE}/api/transcribe`, {
+        method: "POST",
+        body: formData,
+        headers: { "Content-Type": "multipart/form-data" }
+      });
+      const json = await resp.json();
+      const text = json.text || json.transcription || (json?.data?.text) || "";
+      setDisplayText("شما: " + text);
 
-<BoxLink
-  title="Create your first build"
-  description="It should only take a few minutes in total to get up and running for iOS and/or Android."
-  href="/build/setup"
-  Icon={Cube01Icon}
-/>
+      // send to chat
+      const chatResp = await fetch(`${SERVER_BASE}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [
+            { role: "system", content: "تو یک دستیار صمیمی فارسی هستی، لوسی." },
+            { role: "user", content: text }
+          ]
+        })
+      });
+      const chatJson = await chatResp.json();
+      const reply = chatJson.choices?.[0]?.message?.content || "متاسفم، متوجه نشدم.";
+      setDisplayText("لوسی: " + reply);
 
-<BoxLink
-  title="Share your apps with internal testers"
-  description="EAS Build can help share preview builds of your app with a single URL."
-  href="/build/internal-distribution"
-  Icon={Cube01Icon}
-/>
+      // detect mood with a simple heuristic or ask server for classification
+      const mood = detectMoodFromText(reply);
+      setLucyMood(mood);
 
-<BoxLink
-  title="Automate submissions"
-  description="Learn how you can have the service take your successful builds and handle uploading them to app stores for you automatically."
-  href="/build/automate-submissions"
-  Icon={Cube01Icon}
-/>
+      // request TTS (server returns audio)
+      const ttsResp = await fetch(`${SERVER_BASE}/api/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: reply })
+      });
+      const arrayBuffer = await ttsResp.arrayBuffer();
+      const fileUri = FileSystem.documentDirectory + "lucy_reply.mp3";
+      await FileSystem.writeAsStringAsync(fileUri, Buffer.from(arrayBuffer).toString("base64"), { encoding: FileSystem.EncodingType.Base64 });
+      const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
+      soundRef.current = sound;
+      await sound.playAsync();
 
-<BoxLink
-  title="App version management"
-  description="Automate version bumps so you never have to think about them again."
-  href="/build-reference/app-versions"
-  Icon={Cube01Icon}
-/>
+    } catch (err) {
+      console.error(err);
+      alert("خطا در ارسال یا پردازش");
+    } finally {
+      setIsProcessing(false);
+      setRecording(null);
+    }
+  }
 
-<BoxLink
-  title="Run builds locally or on your own infrastructure"
-  description="EAS Build is a hosted service, but you can also run it on your own machine, for example, to debug or to comply with any company security policies."
-  href="/build-reference/local-builds"
-  Icon={Cube01Icon}
-/>
+  function detectMoodFromText(text) {
+    const t = text.toLowerCase();
+    if (t.includes("خوش") || t.includes("😊")) return "happy";
+    if (t.includes("غم") || t.includes("دلم گرفت") || t.includes("گریه")) return "sad";
+    if (t.includes("عصب") || t.includes("اعصاب")) return "angry";
+    if (t.includes("خجالت") || t.includes("شرم")) return "shy";
+    return "neutral";
+  }
 
-<BoxLink
-  title="Limitations"
-  description="EAS Build is new and rapidly evolving, so we recommend getting familiar with the current limitations."
-  href="/build-reference/limitations"
-  Icon={Cube01Icon}
-/>
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Lucy AI Assistant</Text>
+      <Image source={moods[lucyMood]} style={styles.avatar} />
+      <Text style={styles.text}>{displayText}</Text>
+
+      <View style={{ flexDirection: "row", marginTop: 20 }}>
+        <TouchableOpacity onPress={startRecording} style={styles.btn}>
+          <Text style={styles.btnText}>شروع ضبط</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={stopRecordingAndSend} style={[styles.btn, { backgroundColor: "#ff0066" }]}>
+          <Text style={styles.btnText}>توقف و ارسال</Text>
+        </TouchableOpacity>
+      </View>
+
+      {isProcessing && <ActivityIndicator size="large" color="#ff0066" style={{ marginTop: 20 }} />}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#05050a", alignItems: "center", paddingTop: 60 },
+  title: { color: "#fff", fontSize: 22, marginBottom: 10 },
+  avatar: { width: 220, height: 220, borderRadius: 12, marginTop: 10 },
+  text: { color: "#ddd", padding: 20, textAlign: "center" },
+  btn: { backgroundColor: "#00d1b2", padding: 14, marginHorizontal: 6, borderRadius: 10 },
+  btnText: { color: "#fff", fontWeight: "600" }
+}); 
